@@ -1,4 +1,7 @@
 lxml>=4.9.3
 beautifulsoup4>=4.12.2
 argparse>=1.4.0
-cssutils>=2.7.0 
+cssutils>=2.7.0
+PyQt5>=5.15.6
+PyQtWebEngine>=5.15.6
+svgpathtools>=1.6.0 

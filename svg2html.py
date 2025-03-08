@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from lxml import etree
 import cssutils
 import logging
+import svgpathtools  # 添加SVG路径处理库
 
 # 禁用cssutils的日志
 cssutils.log.setLevel(logging.CRITICAL)
@@ -236,6 +237,8 @@ class SVG2HTML:
         
         # 处理SVG元素
         element_id = 0
+        element_styles = {}  # 用于存储元素样式，以便后续优化
+        
         for element in svg_tag.find_all(True):
             tag_name = element.name
             
@@ -250,13 +253,28 @@ class SVG2HTML:
             element_css = self._extract_element_style(element, tag_name, min_x, min_y, vb_width, vb_height, width, height)
             
             if element_css:
-                # 添加CSS类
-                css.append(f'.{element_class} {{ {element_css} }}')
+                # 存储样式以便后续优化
+                element_styles[element_class] = self._parse_css_properties(element_css)
                 
                 # 创建HTML元素
                 html_element = self._create_html_element(html_doc, element, tag_name, element_class)
                 if html_element:
                     container.append(html_element)
+        
+        # 优化CSS
+        optimized_css = self._optimize_css(element_styles)
+        
+        # 将优化后的CSS添加到样式表
+        for selector, properties in optimized_css.items():
+            css_rule = f"{selector} {{ {'; '.join(f'{k}: {v}' for k, v in properties.items())}; }}"
+            css.append(css_rule)
+        
+        # 添加折线和路径的JavaScript处理
+        js_code = self._generate_path_js()
+        if js_code:
+            script = html_doc.new_tag('script')
+            script.string = js_code
+            head.append(script)
         
         # 设置CSS样式
         style.string = '\n'.join(css)
@@ -359,6 +377,30 @@ class SVG2HTML:
             if stroke and stroke.lower() != 'none':
                 css_props.append(f"border: {self._fmt(stroke_width)}px solid {stroke};")
                 
+        elif tag_name == 'ellipse':
+            # 添加椭圆支持
+            cx = self._get_float_attr(element, 'cx', 0)
+            cy = self._get_float_attr(element, 'cy', 0)
+            rx = self._get_float_attr(element, 'rx', 0)
+            ry = self._get_float_attr(element, 'ry', 0)
+            
+            css_props.append(f"left: {self._fmt(cx - rx)}px;")
+            css_props.append(f"top: {self._fmt(cy - ry)}px;")
+            css_props.append(f"width: {self._fmt(2 * rx)}px;")
+            css_props.append(f"height: {self._fmt(2 * ry)}px;")
+            css_props.append(f"border-radius: 50%;")
+            
+            # 背景颜色
+            fill = element.get('fill', 'none')
+            if fill and fill.lower() != 'none':
+                css_props.append(f"background-color: {fill};")
+            
+            # 边框
+            stroke = element.get('stroke')
+            stroke_width = self._get_float_attr(element, 'stroke-width', 1)
+            if stroke and stroke.lower() != 'none':
+                css_props.append(f"border: {self._fmt(stroke_width)}px solid {stroke};")
+                
         elif tag_name == 'line':
             x1 = self._get_float_attr(element, 'x1', 0)
             y1 = self._get_float_attr(element, 'y1', 0)
@@ -408,6 +450,69 @@ class SVG2HTML:
             stroke = element.get('stroke', 'black')
             css_props.append(f"background-color: {stroke};")
             
+        elif tag_name == 'polyline' or tag_name == 'polygon':
+            # 添加折线和多边形支持
+            points_str = element.get('points', '')
+            if not points_str:
+                return ' '.join(css_props)
+                
+            # 解析点坐标
+            points = []
+            for point in points_str.split():
+                if ',' in point:
+                    x, y = point.split(',')
+                    try:
+                        points.append((float(x), float(y)))
+                    except ValueError:
+                        continue
+            
+            if not points:
+                return ' '.join(css_props)
+                
+            # 计算边界框
+            min_x = min(p[0] for p in points)
+            min_y = min(p[1] for p in points)
+            max_x = max(p[0] for p in points)
+            max_y = max(p[1] for p in points)
+            
+            css_props.append(f"left: {self._fmt(min_x)}px;")
+            css_props.append(f"top: {self._fmt(min_y)}px;")
+            css_props.append(f"width: {self._fmt(max_x - min_x)}px;")
+            css_props.append(f"height: {self._fmt(max_y - min_y)}px;")
+            
+            # 对于多边形，添加背景色
+            if tag_name == 'polygon':
+                fill = element.get('fill', 'none')
+                if fill and fill.lower() != 'none':
+                    css_props.append(f"background-color: {fill};")
+                    
+                    # 创建一个多边形形状的CSS clip-path
+                    normalized_points = []
+                    for x, y in points:
+                        nx = (x - min_x) / (max_x - min_x) * 100
+                        ny = (y - min_y) / (max_y - min_y) * 100
+                        normalized_points.append(f"{self._fmt(nx)}% {self._fmt(ny)}%")
+                    
+                    clip_path = f"polygon({', '.join(normalized_points)})"
+                    css_props.append(f"clip-path: {clip_path};")
+            
+            # 边框
+            stroke = element.get('stroke')
+            stroke_width = self._get_float_attr(element, 'stroke-width', 1)
+            if stroke and stroke.lower() != 'none':
+                if tag_name == 'polygon':
+                    css_props.append(f"border: {self._fmt(stroke_width)}px solid {stroke};")
+                else:
+                    # 对于折线，使用背景色模拟线条
+                    css_props.append(f"background-color: transparent;")
+                    css_props.append(f"border: none;")
+                    
+                    # 创建一个自定义属性来存储点信息，用于JavaScript处理
+                    points_data = ' '.join(f"{self._fmt(x)},{self._fmt(y)}" for x, y in points)
+                    css_props.append(f"--polyline-points: '{points_data}';")
+                    css_props.append(f"--polyline-stroke: '{stroke}';")
+                    css_props.append(f"--polyline-stroke-width: '{self._fmt(stroke_width)}';")
+            
         elif tag_name == 'text':
             x = self._get_float_attr(element, 'x', 0)
             y = self._get_float_attr(element, 'y', 0)
@@ -439,14 +544,12 @@ class SVG2HTML:
                     css_props.append(f"transform: {css_transform};")
         
         elif tag_name == 'path':
-            # 路径转换为边框，这里简化处理
+            # 路径转换为边框，这里使用改进的路径处理
             stroke = element.get('stroke', 'none')
-            if stroke and stroke.lower() != 'none':
-                css_props.append(f"border: 1px solid {stroke};")
-                
-            # 路径的位置和尺寸很难精确计算，这里使用近似
-            # 后续可以考虑使用SVG路径解析库提高精度
+            fill = element.get('fill', 'none')
             d = element.get('d', '')
+            
+            # 计算路径边界
             path_bounds = self._calculate_path_bounds(d)
             if path_bounds:
                 x, y, width, height = path_bounds
@@ -454,6 +557,18 @@ class SVG2HTML:
                 css_props.append(f"top: {self._fmt(y)}px;")
                 css_props.append(f"width: {self._fmt(width)}px;")
                 css_props.append(f"height: {self._fmt(height)}px;")
+                
+                # 如果有填充色
+                if fill and fill.lower() != 'none':
+                    css_props.append(f"background-color: {fill};")
+                    
+                    # 存储路径数据用于可能的JavaScript处理
+                    css_props.append(f"--path-data: '{d}';")
+                
+                # 如果有描边
+                if stroke and stroke.lower() != 'none':
+                    stroke_width = self._get_float_attr(element, 'stroke-width', 1)
+                    css_props.append(f"border: {self._fmt(stroke_width)}px solid {stroke};")
         
         return ' '.join(css_props)
     
@@ -472,13 +587,15 @@ class SVG2HTML:
         """
         html_element = None
         
-        if tag_name == 'rect' or tag_name == 'circle' or tag_name == 'line' or tag_name == 'path':
+        if tag_name in ['rect', 'circle', 'ellipse', 'line', 'path', 'polygon', 'polyline']:
             html_element = doc.new_tag('div')
-            html_element['class'] = element_class
+            html_element['class'] = f"{element_class} svg-element"
+            html_element['data-type'] = tag_name
             
         elif tag_name == 'text':
             html_element = doc.new_tag('div')
-            html_element['class'] = element_class
+            html_element['class'] = f"{element_class} svg-element"
+            html_element['data-type'] = 'text'
             
             # 获取文本内容
             text_content = svg_element.string or ''.join(t.string or '' for t in svg_element.find_all(text=True))
@@ -487,7 +604,8 @@ class SVG2HTML:
         elif tag_name == 'foreignObject':
             # 处理foreignObject元素
             html_element = doc.new_tag('div')
-            html_element['class'] = element_class
+            html_element['class'] = f"{element_class} svg-element"
+            html_element['data-type'] = 'foreignObject'
             
             # 直接提取内部HTML
             inner_html = ''.join(str(c) for c in svg_element.children)
@@ -596,27 +714,40 @@ class SVG2HTML:
         if not path_data:
             return None
             
-        # 简化处理：提取所有数字，成对处理为坐标点
-        numbers = re.findall(r'[-+]?\d*\.\d+|[-+]?\d+', path_data)
-        points = []
-        
-        for i in range(0, len(numbers) - 1, 2):
-            try:
-                x, y = float(numbers[i]), float(numbers[i + 1])
-                points.append((x, y))
-            except (ValueError, IndexError):
-                continue
-        
-        if not points:
-            return None
+        try:
+            # 使用svgpathtools解析路径
+            path = svgpathtools.parse_path(path_data)
             
-        # 计算边界框
-        min_x = min(p[0] for p in points)
-        min_y = min(p[1] for p in points)
-        max_x = max(p[0] for p in points)
-        max_y = max(p[1] for p in points)
-        
-        return (min_x, min_y, max_x - min_x, max_y - min_y)
+            # 如果路径为空，返回None
+            if not path:
+                return None
+                
+            # 计算路径的边界框
+            xmin, xmax, ymin, ymax = path.bbox()
+            
+            return (xmin, ymin, xmax - xmin, ymax - ymin)
+        except Exception:
+            # 如果解析失败，回退到简单的正则表达式方法
+            numbers = re.findall(r'[-+]?\d*\.\d+|[-+]?\d+', path_data)
+            points = []
+            
+            for i in range(0, len(numbers) - 1, 2):
+                try:
+                    x, y = float(numbers[i]), float(numbers[i + 1])
+                    points.append((x, y))
+                except (ValueError, IndexError):
+                    continue
+            
+            if not points:
+                return None
+                
+            # 计算边界框
+            min_x = min(p[0] for p in points)
+            min_y = min(p[1] for p in points)
+            max_x = max(p[0] for p in points)
+            max_y = max(p[1] for p in points)
+            
+            return (min_x, min_y, max_x - min_x, max_y - min_y)
     
     def _get_float_attr(self, element, attr_name: str, default: float = 0) -> float:
         """
@@ -678,6 +809,147 @@ class SVG2HTML:
         if x == 0:
             return 1.5707963267948966 if y > 0 else -1.5707963267948966
         return round(float(y) / float(x), 8) if x != 0 else 0
+    
+    def _parse_css_properties(self, css_string: str) -> Dict[str, str]:
+        """
+        解析CSS属性字符串为字典
+        
+        Args:
+            css_string: CSS属性字符串
+            
+        Returns:
+            Dict[str, str]: CSS属性字典
+        """
+        properties = {}
+        for prop in css_string.split(';'):
+            if not prop.strip():
+                continue
+            
+            if ':' in prop:
+                key, value = prop.split(':', 1)
+                properties[key.strip()] = value.strip()
+        
+        return properties
+    
+    def _optimize_css(self, element_styles: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+        """
+        优化CSS，提取公共样式
+        
+        Args:
+            element_styles: 元素样式字典
+            
+        Returns:
+            Dict[str, Dict[str, str]]: 优化后的CSS
+        """
+        # 复制原始样式
+        optimized = {selector: props.copy() for selector, props in element_styles.items()}
+        
+        # 查找公共样式
+        common_styles = {}
+        all_selectors = list(element_styles.keys())
+        
+        # 按元素类型分组
+        element_types = {}
+        for selector in all_selectors:
+            # 从类名中提取元素类型
+            if '-' in selector:
+                element_type = selector.split('-')[1]
+                if element_type not in element_types:
+                    element_types[element_type] = []
+                element_types[element_type].append(selector)
+        
+        # 为每种元素类型创建公共样式
+        for element_type, selectors in element_types.items():
+            if len(selectors) < 2:
+                continue
+                
+            # 查找这种元素类型的所有选择器中的公共属性
+            common_props = {}
+            first_selector = selectors[0]
+            first_props = element_styles[first_selector]
+            
+            for prop, value in first_props.items():
+                # 检查是否所有选择器都有相同的属性值
+                if all(element_styles[sel].get(prop) == value for sel in selectors):
+                    common_props[prop] = value
+            
+            # 如果有公共属性，创建一个新的选择器
+            if common_props:
+                type_selector = f".svg-element[data-type='{element_type}']"
+                common_styles[type_selector] = common_props
+                
+                # 从原始样式中移除公共属性
+                for selector in selectors:
+                    for prop in common_props:
+                        if prop in optimized[selector]:
+                            del optimized[selector][prop]
+        
+        # 合并结果
+        optimized.update(common_styles)
+        
+        return optimized
+    
+    def _generate_path_js(self) -> str:
+        """
+        生成处理路径和折线的JavaScript代码
+        
+        Returns:
+            str: JavaScript代码
+        """
+        return """
+        document.addEventListener('DOMContentLoaded', function() {
+            // 处理折线
+            var polylines = document.querySelectorAll('[data-type="polyline"]');
+            polylines.forEach(function(element) {
+                var points = element.style.getPropertyValue('--polyline-points');
+                var stroke = element.style.getPropertyValue('--polyline-stroke');
+                var strokeWidth = element.style.getPropertyValue('--polyline-stroke-width');
+                
+                if (points && stroke) {
+                    // 创建SVG元素来绘制折线
+                    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                    svg.setAttribute('width', '100%');
+                    svg.setAttribute('height', '100%');
+                    svg.style.position = 'absolute';
+                    svg.style.top = '0';
+                    svg.style.left = '0';
+                    
+                    var polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+                    polyline.setAttribute('points', points.replace(/'/g, ''));
+                    polyline.setAttribute('stroke', stroke.replace(/'/g, ''));
+                    polyline.setAttribute('stroke-width', strokeWidth.replace(/'/g, ''));
+                    polyline.setAttribute('fill', 'none');
+                    
+                    svg.appendChild(polyline);
+                    element.appendChild(svg);
+                }
+            });
+            
+            // 处理路径
+            var paths = document.querySelectorAll('[data-type="path"]');
+            paths.forEach(function(element) {
+                var pathData = element.style.getPropertyValue('--path-data');
+                
+                if (pathData) {
+                    // 创建SVG元素来绘制路径
+                    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                    svg.setAttribute('width', '100%');
+                    svg.setAttribute('height', '100%');
+                    svg.style.position = 'absolute';
+                    svg.style.top = '0';
+                    svg.style.left = '0';
+                    
+                    var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    path.setAttribute('d', pathData.replace(/'/g, ''));
+                    path.setAttribute('fill', 'inherit');
+                    path.setAttribute('stroke', 'inherit');
+                    
+                    svg.appendChild(path);
+                    element.appendChild(svg);
+                }
+            });
+        });
+        """
 
 
 def parse_arguments() -> argparse.Namespace:
